@@ -26,6 +26,15 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from config import settings
 from database import StateManager, init_database
 
+# parser.py — добавить в секцию импортов
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # для Python < 3.9
+
+# Moscow timezone — тот же, что используется в ClickHouse
+MOSCOW_TZ = ZoneInfo('Europe/Moscow')
+
 
 # ============================================================================
 # 🔧 НАСТРОЙКА ЛОГИРОВАНИЯ
@@ -279,6 +288,61 @@ def _parse_date_from_filename(fn: str) -> Optional[datetime]:
         year = 2000 + int(yy)
         return datetime(year, int(mm), int(dd), int(hh))
     return None
+
+
+def _is_active_log(file_path: Path) -> bool:
+    """
+    Проверяет, является ли лог-файл "активным" (относится к текущему часу).
+    """
+    log_dt = _parse_date_from_filename(str(file_path))
+    if not log_dt:
+        return False
+
+    # Приводим время из имени файла к часовому поясу Москвы
+    log_dt_msk = log_dt.replace(tzinfo=MOSCOW_TZ)
+    now_msk = datetime.now(MOSCOW_TZ)
+
+    # Сравниваем год, месяц, день и час
+    return (log_dt_msk.year == now_msk.year and
+            log_dt_msk.month == now_msk.month and
+            log_dt_msk.day == now_msk.day and
+            log_dt_msk.hour == now_msk.hour)
+
+
+def _is_active_log(file_path: Path) -> bool:
+    """
+    Проверить, является ли лог-файл активным (пишется 1С прямо сейчас).
+
+    Активный лог — это файл, час которого (из имени YYMMDDHH.log)
+    совпадает с текущим часом в часовом поясе Moscow.
+
+    Returns:
+        True  — файл активный, его НЕ НУЖНО обрабатывать сейчас
+        False — файл завершён (или имя некорректное), можно обрабатывать
+    """
+    try:
+        log_datetime = _parse_date_from_filename(str(file_path))
+        if log_datetime is None:
+            # Не смогли распарсить имя — считаем неактивным, пусть парсер сам разберётся
+            return False
+
+        # Приводим к Moscow timezone для корректного сравнения
+        now_moscow = datetime.now(MOSCOW_TZ)
+        log_moscow = log_datetime.replace(tzinfo=MOSCOW_TZ)
+
+        # Сравниваем часы. Если совпадают — файл активный
+        is_active = (log_moscow.year == now_moscow.year and
+                     log_moscow.month == now_moscow.month and
+                     log_moscow.day == now_moscow.day and
+                     log_moscow.hour == now_moscow.hour)
+
+        if is_active:
+            logger.debug(f"⏭ Пропускаем активный лог: {file_path.name} (час {log_moscow.hour}:00)")
+
+        return is_active
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка проверки активности {file_path}: {e}")
+        return False
 
 
 def _parse_props(prop_str: str) -> Dict[str, str]:
@@ -580,6 +644,7 @@ class TJLogDaemon:
         logger.info(f" Watch dirs: {self.watch_dirs}")
         logger.info(f"⏱ Poll interval: {self.poll_interval}s")
 
+
     def _find_new_files(self) -> Generator[tuple, None, None]:
         """Найти новые необработанные файлы"""
         if not self.root_dir.exists():
@@ -599,6 +664,11 @@ class TJLogDaemon:
                 if any(excluded in file_parts for excluded in self.excluded_dirs):
                     continue
 
+                # 🔧 НОВОЕ: Пропускаем активные логи, если включена настройка
+                if settings.parser_ignore_active_logs and _is_active_log(log_file):
+                    logger.debug(f"⏭ Пропуск активного лога: {log_file.name}")
+                    continue
+
                 if self.state.is_processed(log_file):
                     continue
 
@@ -612,6 +682,7 @@ class TJLogDaemon:
                     directory_name = watch_dir
 
                 yield log_file, directory_name
+
 
     def _scan_and_parse(self, stats_id: int):
         """Один цикл сканирования и парсинга"""
@@ -670,6 +741,7 @@ class TJLogDaemon:
             f"{errors} errors, "
             f"{elapsed:.1f}s"
         )
+
 
     def run(self):
         """Основной цикл демона"""

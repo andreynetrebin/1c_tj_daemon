@@ -14,6 +14,7 @@ import sys
 import time
 from pathlib import Path
 from datetime import datetime, timedelta
+from sqlalchemy import text
 
 import pytest
 
@@ -63,8 +64,9 @@ class TestStateManagerInit:
     def test_creates_tables(self, state_manager):
         """StateManager создаёт таблицы."""
         with state_manager.get_session() as session:
+            # 🔧 ИСПРАВЛЕНО: обернули строку в text()
             result = session.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
+                text("SELECT name FROM sqlite_master WHERE type='table'")
             )
             tables = [row[0] for row in result]
             assert 'processed_files' in tables
@@ -303,8 +305,9 @@ class TestInitDatabase:
 
         sm = StateManager(str(db_path))
         with sm.get_session() as session:
+            # 🔧 ИСПРАВЛЕНО: обернули строку в text()
             result = session.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
+                text("SELECT name FROM sqlite_master WHERE type='table'")
             )
             tables = [row[0] for row in result]
             assert 'processed_files' in tables
