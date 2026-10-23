@@ -19,15 +19,14 @@ from tests.conftest import MockClickHouseLoader
 @pytest.fixture
 def large_log_file(tmp_path):
     """Большой лог-файл для тестов производительности."""
-    log_file = tmp_path / "26092610_large.log"
+    log_file = tmp_path / "26092610.log"
 
-    # Генерируем 10000 событий
+    # Генерируем 10000 событий с валидным форматом времени (00:00)
+    # Это гарантирует, что regex ^(\d{2}):(\d{2}) всегда будет срабатывать
     with open(log_file, 'wb') as f:
         for i in range(10000):
-            minute = i // 60
-            second = i % 60
             f.write(
-                f"{minute:02d}:{second:02d}.123456-0,SDBL,4,"
+                f"00:00.123456-0,SDBL,4,"
                 f"p:processName=test_app,t:computerName=TestSrv,"
                 f"t:connectID={1000 + i},Usr=TestUser,"
                 f"Func=BeginTransaction\n".encode('utf-8')
