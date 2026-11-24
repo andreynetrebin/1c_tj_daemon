@@ -1,0 +1,57 @@
+CREATE TABLE IF NOT EXISTS NetrebinAA.tj_events_ut_v2
+(
+    timestamp DateTime64(6, 'Europe/Moscow') CODEC(Delta(8), ZSTD(1)),
+    directory_name LowCardinality(String),
+    source_file String,
+    line_number UInt64 CODEC(ZSTD(1)),
+    loaded_at DateTime64(6, 'Europe/Moscow') CODEC(Delta(8), ZSTD(1)),
+    event_name LowCardinality(String),
+    level UInt8,
+    duration_sec Float64,
+    p_processName LowCardinality(String),
+    t_computerName String,
+    t_connectID Nullable(UInt32),
+    usr LowCardinality(String),
+    dbpid Nullable(UInt16),
+    osThread Nullable(UInt32),
+    sessionID String,
+
+    sessionID_main Nullable(UInt64) ALIAS accurateCastOrNull(extract(sessionID, '^([0-9]+)(?:[(][0-9]+[)])?$'), 'UInt64'),
+    sessionID_extra Nullable(UInt64) ALIAS accurateCastOrNull(extract(sessionID, '^[0-9]+[(]([0-9]+)[)]$'), 'UInt64'),
+    trans Nullable(UInt8),
+    func LowCardinality(String),
+    module LowCardinality(String),
+    method LowCardinality(String),
+    memory Nullable(Int64),
+    memoryPeak Nullable(UInt64),
+    inBytes Nullable(UInt64),
+    outBytes Nullable(UInt64),
+    cpuTime Nullable(UInt64),
+    tableName LowCardinality(String),
+    context String CODEC(ZSTD(3)),
+    sql String CODEC(ZSTD(3)),
+    sdbl String CODEC(ZSTD(3)),
+    planSQLText String CODEC(ZSTD(3)),
+    exception String CODEC(ZSTD(3)),
+    locks String CODEC(ZSTD(3)),
+    waitConnections String,
+    deadlockConnectionIntersections String,
+    lkaid String,
+    lka String,
+    lkp String,
+    lkpid String,
+    lksrc String,
+    rows Nullable(UInt64),
+    rowsAffected Nullable(Int64),
+    description String,
+    data String CODEC(ZSTD(3)),
+    severity LowCardinality(String),
+    category LowCardinality(String),
+    INDEX idx_en event_name TYPE bloom_filter GRANULARITY 8192,
+    INDEX idx_usr usr TYPE bloom_filter GRANULARITY 8192
+)
+ENGINE = MergeTree()
+PARTITION BY toDate(timestamp)
+ORDER BY (timestamp, event_name)
+TTL timestamp + INTERVAL 30 DAY
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1;
