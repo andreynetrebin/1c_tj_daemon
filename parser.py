@@ -135,7 +135,7 @@ class ClickHouseLoader:
                 memoryPeak Nullable(UInt64),
                 inBytes Nullable(UInt64),
                 outBytes Nullable(UInt64),
-                cpuTime Nullable(UInt64),
+                cpuTime_sec Nullable(Float64),
                 tableName LowCardinality(String),
                 context String CODEC(ZSTD(3)),
                 sql String CODEC(ZSTD(3)),
@@ -198,7 +198,7 @@ class ClickHouseLoader:
                     e.get('memoryPeak'),
                     e.get('inBytes'),
                     e.get('outBytes'),
-                    e.get('cpuTime'),
+                    e.get('cpuTime_sec'),
                     e.get('tableName', ''),
                     (e.get('context') or '')[:100000],
                     (e.get('sql') or '')[:100000],
@@ -228,7 +228,7 @@ class ClickHouseLoader:
                     'timestamp', 'directory_name', 'source_file', 'line_number', 'loaded_at',
                     'event_name', 'level', 'duration_sec', 'p_processName', 't_computerName',
                     't_connectID', 'usr', 'dbpid', 'osThread', 'sessionID', 'trans', 'func',
-                    'module', 'method', 'memory', 'memoryPeak', 'inBytes', 'outBytes', 'cpuTime',
+                    'module', 'method', 'memory', 'memoryPeak', 'inBytes', 'outBytes', 'cpuTime_sec',
                     'tableName', 'context', 'sql', 'sdbl', 'planSQLText', 'exception',
                     'locks', 'waitConnections', 'deadlockConnectionIntersections',
                     'lkaid', 'lka', 'lkp', 'lkpid', 'lksrc', 'rows', 'rowsAffected',
@@ -271,6 +271,11 @@ def _nullable_int(value, type_name):
         pass
     logger.warning('Invalid %s TJ property: %r', type_name, raw[:100])
     return None
+
+
+def _cpu_seconds(value):
+    micros = _nullable_int(value, 'UInt64')
+    return None if micros is None else micros / 1_000_000
 
 
 def _detect_encoding(fp: Path) -> str:
@@ -542,7 +547,7 @@ def _build_event(timestamp: datetime, event_name: str, level: int,
             'memoryPeak': _nullable_int(props.get('MemoryPeak'), 'UInt64'),
             'inBytes': _nullable_int(props.get('InBytes'), 'UInt64'),
             'outBytes': _nullable_int(props.get('OutBytes'), 'UInt64'),
-            'cpuTime': _nullable_int(props.get('CpuTime'), 'UInt64'),
+            'cpuTime_sec': _cpu_seconds(props.get('CpuTime')),
             'tableName': props.get('tableName', ''),
             'context': props.get('Context', '')[:100000],
             'sql': props.get('Sql', props.get('SQL', ''))[:100000],
