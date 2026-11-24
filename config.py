@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     parser_root_directory: str = "Y:\\Monitor\\Happywear_New"
     parser_poll_interval: int = 60
     parser_batch_size: int = 5000
+    parser_batch_max_bytes: int = 16 * 1024 * 1024
+    parser_max_line_bytes: int = 8 * 1024 * 1024
     parser_state_db_path: str = "C:\\projects\\1с_tj_daemon_app\\1c_tj_daemon\\data\\state.db"
     parser_log_file: str = "C:\\projects\\1с_tj_daemon_app\\1c_tj_daemon\\logs\\daemon.log"
     parser_log_level: str = "INFO"
