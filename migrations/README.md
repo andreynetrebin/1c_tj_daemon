@@ -18,7 +18,7 @@
 
 ```sql
 SELECT timestamp, loaded_at, sessionID, module, method, duration_sec,
-       memory, memoryPeak, inBytes, outBytes, cpuTime
+       memory, memoryPeak, inBytes, outBytes, cpuTime_sec
 FROM NetrebinAA.tj_events_ut_v2
 WHERE event_name = 'CALL'
 ORDER BY timestamp DESC LIMIT 20;
@@ -61,3 +61,8 @@ PARSER_IGNORE_ACTIVE_LOGS=true
 ```
 
 Проверка: python -m pytest tests/test_streaming_parser.py -v, затем весь набор тестов. На PROD сначала проверить отсутствие уже загруженных строк проблемного файла и сохранённый checkpoint, затем развернуть parser.py при остановленной службе. Не сбрасывать SQLite. Следить за MemoryCurrent/MemoryPeak и журналом systemd. Новые колонки метрик размера события не обязательны и в данном изменении не добавлены.
+
+
+## CPU time in seconds
+
+Fresh installations use updated 001/002. Existing v2 installations with legacy cpuTime Nullable(UInt64) must stop the daemon, verify the old column contains microseconds only, then run 003_cpu_time_seconds.sql before deploying the new parser. Existing raw cpuTime is retained; cpuTime_sec is Nullable(Float64), computed from the old column for historical parts and explicitly inserted for new events. Do not rerun a materialization after deploying new code without reviewing ClickHouse version semantics. Update analytics to cpuTime_sec. Do not use old parser against a fresh seconds-only schema. Do not remove the legacy column while the DEFAULT references it.
