@@ -7,10 +7,10 @@ import pytest
 from parser import _build_event, _nullable_int, parse_file, ClickHouseLoader
 
 CALLS = [
-    ("00:02.258031-1732972,CALL,1,process=rphost,OSThread=37576,t:clientID=402,callWait=0,first=true,Usr=DefUser,SessionID=48592,p:processName=Happywear_New,Func=Background job,Module=HW_РассылкаTelegramСервер,Method=HW_РассылкиTelegramФормированиеСообщений,Memory=163219,MemoryPeak=5544697,InBytes=0,OutBytes=0,CpuTime=109375", ("HW_РассылкаTelegramСервер", "HW_РассылкиTelegramФормированиеСообщений", 163219, 5544697, 0, 0, 109375, 1.732972)),
-    ("00:02.789014-2278970,CALL,1,process=rphost,OSThread=42472,t:clientID=395,callWait=0,first=true,Usr=Администратор,SessionID=48580,p:processName=Happywear_New,Func=Background job,Module=ДополнительныеОтчетыИОбработки,Method=ВыполнитьОбработкуПоРегламентномуЗаданию,Memory=623523,MemoryPeak=11780887,InBytes=235238,OutBytes=218641,CpuTime=375000", ("ДополнительныеОтчетыИОбработки", "ВыполнитьОбработкуПоРегламентномуЗаданию", 623523, 11780887, 235238, 218641, 375000, 2.278970)),
+    ("00:02.258031-1732972,CALL,1,process=rphost,OSThread=37576,t:clientID=402,callWait=0,first=true,Usr=DefUser,SessionID=48592,p:processName=Happywear_New,Func=Background job,Module=HW_РассылкаTelegramСервер,Method=HW_РассылкиTelegramФормированиеСообщений,Memory=163219,MemoryPeak=5544697,InBytes=0,OutBytes=0,CpuTime=109375", ("HW_РассылкаTelegramСервер", "HW_РассылкиTelegramФормированиеСообщений", 163219, 5544697, 0, 0, 0.109375, 1.732972)),
+    ("00:02.789014-2278970,CALL,1,process=rphost,OSThread=42472,t:clientID=395,callWait=0,first=true,Usr=Администратор,SessionID=48580,p:processName=Happywear_New,Func=Background job,Module=ДополнительныеОтчетыИОбработки,Method=ВыполнитьОбработкуПоРегламентномуЗаданию,Memory=623523,MemoryPeak=11780887,InBytes=235238,OutBytes=218641,CpuTime=375000", ("ДополнительныеОтчетыИОбработки", "ВыполнитьОбработкуПоРегламентномуЗаданию", 623523, 11780887, 235238, 218641, 0.375, 2.278970)),
 ]
-FIELDS = ("module", "method", "memory", "memoryPeak", "inBytes", "outBytes", "cpuTime", "duration_sec")
+FIELDS = ("module", "method", "memory", "memoryPeak", "inBytes", "outBytes", "cpuTime_sec", "duration_sec")
 
 
 @pytest.mark.parametrize("line,expected", CALLS)
@@ -38,7 +38,7 @@ def test_missing_and_signed_properties():
     assert event["memory"] == -12
     assert event["inBytes"] == 0
     assert event["outBytes"] is None
-    assert event["cpuTime"] is None
+    assert event["cpuTime_sec"] is None
     assert event["module"] == ""
     assert event["t_connectID"] is None
 
@@ -85,3 +85,9 @@ def test_insert_columns():
     mapping = dict(zip(columns, row))
     assert tuple(mapping[k] for k in FIELDS) == CALLS[0][1]
     assert "mssql_error_code" not in mapping
+
+
+@pytest.mark.parametrize("raw,expected", [("0", 0.0), ("1", 0.000001), ("1676656250", 1676.65625), ("", None), ("-1", None)])
+def test_cpu_seconds(raw, expected):
+    from parser import _cpu_seconds
+    assert _cpu_seconds(raw) == expected
