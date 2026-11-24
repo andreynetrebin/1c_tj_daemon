@@ -410,12 +410,115 @@ def _parse_props(prop_str: str) -> Dict[str, str]:
     return props
 
 
+
+# Keep the existing text-field storage policy, but apply it during parsing.
+_TRUNCATED_PROPERTIES = {'Context', 'Sql', 'SQL', 'Sdbl', 'planSQLText', 'Exception', 'Data'}
+_STORED_PROPERTIES = _TRUNCATED_PROPERTIES | {
+    'p:processName', 't:computerName', 't:connectID', 'Usr', 'dbpid',
+    'OSThread', 'SessionID', 'Trans', 'Func', 'Module', 'Method', 'Memory',
+    'MemoryPeak', 'InBytes', 'OutBytes', 'CpuTime', 'tableName', 'Locks',
+    'WaitConnections', 'DeadlockConnectionIntersections', 'lkaid', 'lka',
+    'lkp', 'lkpid', 'lksrc', 'Rows', 'RowsAffected', 'Description'
+}
+_KEY_TOKEN = re.compile(r"""['",=]""")
+_VALUE_TOKEN = re.compile(r"""['",]""")
+
+
+class StreamingProperties:
+    """Bound retained text independently of the raw event size.
+
+    feed() receives one physical line (or its header properties), with newline
+    separators supplied by parse_file. The quote rules match the legacy parser.
+    """
+    def __init__(self, max_retained_chars=8 * 1024 * 1024):
+        self.props = {}
+        self.key = None
+        self.quote = None
+        self.parts = []
+        self.size = 0
+        self.retained = 0
+        self.max_retained = max_retained_chars
+        self.truncated = set()
+
+    def _append(self, text, start, end):
+        if start == end:
+            return
+        if self.key is not None and self.key not in _STORED_PROPERTIES:
+            return
+        limit = (1024 if self.key is None else
+                 100000 if self.key in _TRUNCATED_PROPERTIES else self.max_retained)
+        remaining = min(limit - self.size, self.max_retained - self.retained - self.size)
+        length = end - start
+        if length > remaining:
+            if self.key not in _TRUNCATED_PROPERTIES:
+                raise ValueError('Retained property limit exceeded: %r' % self.key)
+            self.truncated.add(self.key)
+        take = min(length, max(0, remaining))
+        if take:
+            self.parts.append(text[start:start + take])
+            self.size += take
+
+    def _reset(self):
+        self.parts = []
+        self.size = 0
+
+    def _store(self):
+        if self.key in _STORED_PROPERTIES:
+            value = ''.join(self.parts).strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            self.retained -= len(self.props.get(self.key, ''))
+            self.props[self.key] = value
+            self.retained += len(value)
+        self.key = None
+        self._reset()
+
+    def feed(self, text):
+        i = 0
+        end = len(text)
+        while i < end:
+            if self.quote is not None:
+                j = text.find(self.quote, i)
+                if j < 0:
+                    self._append(text, i, end)
+                    return
+                self._append(text, i, j)
+                if j + 1 < end and text[j + 1] == self.quote:
+                    self._append(text, j, j + 1)
+                    i = j + 2
+                else:
+                    self._append(text, j, j + 1)
+                    self.quote = None
+                    i = j + 1
+                continue
+            token = (_KEY_TOKEN if self.key is None else _VALUE_TOKEN).search(text, i)
+            if token is None:
+                self._append(text, i, end)
+                return
+            j = token.start()
+            self._append(text, i, j)
+            c = text[j]
+            if c in "\"'":
+                self.quote = c
+            elif c == '=' and self.key is None:
+                self.key = ''.join(self.parts).strip()
+                self._reset()
+            elif c == ',' and self.key:
+                self._store()
+            i = j + 1
+
+    def finish(self):
+        if self.key and self.size:
+            self._store()
+        return self.props
+
+
 def _build_event(timestamp: datetime, event_name: str, level: int,
                  duration: int, props_str: str, line_num: int,
                  file_path: Path, directory_name: str) -> Optional[Dict[str, Any]]:
     """Построить событие из сырых данных"""
     try:
-        props = _parse_props(props_str)
+        props = props_str if isinstance(props_str, dict) else _parse_props(props_str)
         return {
             'timestamp': timestamp,
             'directory_name': directory_name,
@@ -470,160 +573,121 @@ def _build_event(timestamp: datetime, event_name: str, level: int,
 
 def parse_file(file_path: Path, directory_name: str,
                ch_loader: ClickHouseLoader, batch_size: int,
-               start_line: int = 0) -> Tuple[int, int, Optional[datetime], bool]:
-    """
-    Распарсить файл и вставить события в ClickHouse.
-    """
-    logger.info(f"📖 Парсинг: {file_path.name} (dir: {directory_name}, start_line: {start_line})")
-
+               start_line: int = 0, *, checkpoint=None,
+               batch_max_bytes=None, max_line_bytes=None, should_stop=None
+               ) -> Tuple[int, int, Optional[datetime], bool]:
+    """Stream complete events; checkpoint only after acknowledged inserts."""
+    logger.info("Parsing %s (dir: %s, start_line: %d)", file_path.name, directory_name, start_line)
+    batch_max_bytes = (getattr(settings, 'parser_batch_max_bytes', 16 * 1024 * 1024)
+                       if batch_max_bytes is None else batch_max_bytes)
+    max_line_bytes = (getattr(settings, 'parser_max_line_bytes', 8 * 1024 * 1024)
+                      if max_line_bytes is None else max_line_bytes)
+    if min(batch_size, batch_max_bytes, max_line_bytes) <= 0:
+        raise ValueError('Parser limits must be positive')
     encoding = _detect_encoding(file_path)
     base_date = _parse_date_from_filename(str(file_path))
     if not base_date:
-        logger.warning(f"⚠️ Не удалось определить дату из имени файла: {file_path.name}")
         return (0, 0, None, False)
-
-    events_count = 0
     batch = []
-    current_header = None
-    current_lines = []
-    match_num = 0
-    last_line_number = start_line  # 🔧 Инициализируем start_line
-    last_event_timestamp = None
+    batch_bytes = 0
+    batch_end = start_line
     committed_line = start_line
     committed_events = 0
     committed_ts = None
+    last_line = start_line
+    stream = None
+    header = None
+    event_start = 0
+    event_bytes = 0
 
-    lines_skipped = 0
-    lines_processed = 0
-    current_event_start_line = 0
+    def flush():
+        nonlocal batch, batch_bytes, committed_line, committed_events, committed_ts
+        if not batch:
+            return
+        if not ch_loader.insert_batch(batch):
+            raise RuntimeError('ClickHouse insert failed')
+        ts = batch[-1]['timestamp']
+        # The callback must persist the delta, not the cumulative event count.
+        if checkpoint is not None:
+            checkpoint(len(batch), batch_end, ts)
+        committed_line = batch_end
+        committed_events += len(batch)
+        committed_ts = ts
+        logger.debug("Inserted %d events, estimated %d bytes, checkpoint %d",
+                     len(batch), batch_bytes, committed_line)
+        batch = []
+        batch_bytes = 0
+
+    def finish_event(end_line):
+        nonlocal batch_bytes, batch_end
+        if stream is None:
+            return
+        minute, second, micro, duration, name, level = header
+        ts = base_date.replace(minute=int(minute), second=int(second),
+                               microsecond=int(micro.ljust(6, b'0')[:6]),
+                               tzinfo=MOSCOW_TZ)
+        event = _build_event(ts, name.decode(encoding, errors='replace'),
+                             int(level), int(duration), stream.finish(),
+                             event_start, file_path, directory_name)
+        if event is None:
+            raise ValueError('Cannot build event at line %d' % event_start)
+        if stream.truncated:
+            logger.warning("Truncated text fields in %s:%d (%d raw bytes, %d lines): %s",
+                           file_path.name, event_start, event_bytes,
+                           end_line - event_start + 1, ','.join(sorted(stream.truncated)))
+        # Conservative estimate includes Python string storage and encoded data.
+        size = 1024 + sum(8 * len(v) + 64 if isinstance(v, str) else 64
+                          for v in event.values())
+        if batch and (len(batch) >= batch_size or batch_bytes + size > batch_max_bytes):
+            flush()
+        if size > batch_max_bytes:
+            # Do not silently truncate non-text fields or skip this event.
+            raise ValueError('Event exceeds batch byte budget at line %d' % event_start)
+        batch.append(event)
+        batch_bytes += size
+        batch_end = end_line
+        if len(batch) >= batch_size or batch_bytes >= batch_max_bytes:
+            flush()
 
     try:
         with open(file_path, 'rb', buffering=1048576) as f:
-            for line_number, line_bytes in enumerate(f, 1):
-                # 🔧 Пропускаем уже обработанные строки
+            line_number = 0
+            while True:
+                if should_stop is not None and should_stop():
+                    flush()
+                    return (committed_events, committed_line, committed_ts, False)
+                raw = f.readline(max_line_bytes + 1)
+                if not raw:
+                    break
+                line_number += 1
+                if len(raw) > max_line_bytes:
+                    raise ValueError('Physical line exceeds configured limit at line %d' % line_number)
                 if line_number <= start_line:
-                    lines_skipped += 1
                     continue
-
-                if line_number == 1 and line_bytes.startswith(UTF8_BOM):
-                    line_bytes = line_bytes[len(UTF8_BOM):]
-
-                lines_processed += 1
-                last_line_number = line_number  # 🔧 Это номер строки В ФАЙЛЕ (1, 2, 3...)
-
-                header_match = EVENT_HEADER_PATTERN.match(line_bytes)
-
-                if header_match:
-                    if current_header:
-                        match_num += 1
-                        try:
-                            minute = int(current_header.group(1))
-                            second = int(current_header.group(2))
-                            microseconds = current_header.group(3).decode(encoding, errors='replace')
-                            duration = int(current_header.group(4).decode(encoding, errors='replace'))
-                            event_name = current_header.group(5).decode(encoding, errors='replace')
-                            level = int(current_header.group(6).decode(encoding, errors='replace'))
-                            properties_start = current_header.group(7).decode(encoding, errors='replace')
-
-                            microsec = microseconds.ljust(6, '0')[:6]
-                            event_timestamp = base_date.replace(
-                                minute=minute, second=second, microsecond=int(microsec), tzinfo=MOSCOW_TZ
-                            )
-
-                            last_event_timestamp = event_timestamp
-
-                            full_props = properties_start
-                            if current_lines:
-                                content_decoded = '\n'.join(
-                                    line.decode(encoding, errors='replace') for line in current_lines
-                                )
-                                full_props = properties_start + '\n' + content_decoded
-
-                            # 🔧 ИСПРАВЛЕНИЕ: используем current_event_start_line
-                            event = _build_event(
-                                event_timestamp, event_name, level, duration,
-                                full_props, current_event_start_line, file_path, directory_name
-                            )
-                            if event:
-                                batch.append(event)
-                                events_count += 1
-                                if len(batch) >= batch_size:
-                                    if not ch_loader.insert_batch(batch):
-                                        return (committed_events, committed_line, committed_ts, False)
-                                    committed_events += len(batch)
-                                    committed_line = line_number - 1
-                                    committed_ts = last_event_timestamp
-                                    batch = []
-                                    gc.collect()
-                        except Exception as e:
-                            logger.debug(f"❌ Ошибка парсинга события #{match_num}: {e}")
-
-                    current_header = header_match
-                    current_lines = []
-                    current_event_start_line = line_number  # ← ДОБАВИТЬ ЭТУ СТРОКУ
-                elif current_header:
-                    current_lines.append(line_bytes.rstrip(b'\n\r'))
-
-        # 🔧 Обработка последнего события
-        if current_header:
-            match_num += 1
-            try:
-                minute = int(current_header.group(1))
-                second = int(current_header.group(2))
-                microseconds = current_header.group(3).decode(encoding, errors='replace')
-                duration = int(current_header.group(4).decode(encoding, errors='replace'))
-                event_name = current_header.group(5).decode(encoding, errors='replace')
-                level = int(current_header.group(6).decode(encoding, errors='replace'))
-                properties_start = current_header.group(7).decode(encoding, errors='replace')
-
-                microsec = microseconds.ljust(6, '0')[:6]
-                event_timestamp = base_date.replace(
-                    minute=minute, second=second, microsecond=int(microsec)
-                )
-
-                last_event_timestamp = event_timestamp
-
-                full_props = properties_start
-                if current_lines:
-                    content_decoded = '\n'.join(
-                        line.decode(encoding, errors='replace') for line in current_lines
-                    )
-                    full_props = properties_start + '\n' + content_decoded
-
-                # 🔧 ВАЖНО: line_number — это номер строки В ФАЙЛЕ
-                event = _build_event(
-                    event_timestamp, event_name, level, duration,
-                    full_props, current_event_start_line, file_path, directory_name
-                )
-                if event:
-                    batch.append(event)
-                    events_count += 1
-            except Exception as e:
-                logger.debug(f"❌ Ошибка последнего события: {e}")
-
-        # 🔧 Вставка остатка
-        if batch:
-            if not ch_loader.insert_batch(batch):
-                return (committed_events, committed_line, committed_ts, False)
-            batch = []
-            gc.collect()
-
-        #  Логирование статистики
-        logger.info(
-            f"✅ {file_path.name}: {events_count:,} событий (пропущено {lines_skipped} строк, обработано {lines_processed} строк, строки {start_line + 1}-{last_line_number})")
-
-        # 🔧 Определяем is_complete
-        if lines_processed == 0 and events_count == 0:
-            is_complete = True
-        else:
-            is_complete = False
-
-        return (events_count, last_line_number, last_event_timestamp, is_complete)
-
-    except Exception as e:
-        logger.error(f"❌ Ошибка парсинга {file_path}: {e}")
+                last_line = line_number
+                raw_size = len(raw)
+                if line_number == 1 and raw.startswith(UTF8_BOM):
+                    raw = raw[len(UTF8_BOM):]
+                match = EVENT_HEADER_PATTERN.match(raw)
+                if match:
+                    finish_event(line_number - 1)
+                    header = match.groups()[:6]
+                    stream = StreamingProperties()
+                    event_start = line_number
+                    event_bytes = raw_size
+                    stream.feed(match.group(7).decode(encoding, errors='replace'))
+                elif stream is not None:
+                    event_bytes += raw_size
+                    stream.feed('\n' + raw.rstrip(b'\n\r').decode(encoding, errors='replace'))
+        finish_event(last_line)
+        flush()
+        logger.info("%s: %d events, lines %d-%d", file_path.name, committed_events,
+                    start_line + 1, last_line)
+        return (committed_events, last_line, committed_ts, last_line == start_line)
+    except Exception:
+        logger.exception("Parsing stopped for %s at line %d; confirmed line %d",
+                         file_path, last_line, committed_line)
         return (committed_events, committed_line, committed_ts, False)
-
 
 
 # ============================================================================
@@ -685,7 +749,7 @@ class TJLogDaemon:
                     continue
 
                 # 🔧 НОВОЕ: Пропускаем активные логи, если включена настройка
-                if settings.parser_ignore_active_logs and _is_active_log(log_file):
+                if getattr(settings, 'parser_ignore_active_logs', True) and _is_active_log(log_file):
                     logger.debug(f"⏭ Пропуск активного лога: {log_file.name}")
                     continue
 
@@ -721,16 +785,21 @@ class TJLogDaemon:
             try:
                 start_line = self.state.get_last_line_number(file_path)
 
+                def save_checkpoint(count, line, timestamp):
+                    self.state.mark_processed(file_path, count, last_line_number=line,
+                                              last_event_timestamp=timestamp, is_complete=False)
+
                 events, last_line, last_ts, is_complete = parse_file(
-                    file_path, directory_name, self.ch_loader, self.batch_size, start_line
+                    file_path, directory_name, self.ch_loader, self.batch_size, start_line,
+                    checkpoint=save_checkpoint, should_stop=lambda: self._shutdown
                 )
 
-                self.state.mark_processed(
-                    file_path, events,
-                    last_line_number=last_line,
-                    last_event_timestamp=last_ts,
-                    is_complete=is_complete
-                )
+                # Batch event counts were already persisted. Only finalize position.
+                if last_line > start_line or is_complete:
+                    self.state.mark_processed(
+                        file_path, 0, last_line_number=last_line,
+                        last_event_timestamp=last_ts, is_complete=is_complete
+                    )
 
                 if events >= 0 or last_line > 0:
                     files_processed += 1
@@ -794,6 +863,7 @@ class TJLogDaemon:
 
         except Exception as e:
             logger.exception(f"❌ Fatal error: {e}")
+            raise
         finally:
             self._shutdown_handler()
 
