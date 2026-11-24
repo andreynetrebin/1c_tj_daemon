@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS NetrebinAA.tj_events_ut_v2
     memoryPeak Nullable(UInt64),
     inBytes Nullable(UInt64),
     outBytes Nullable(UInt64),
-    cpuTime Nullable(UInt64),
+    cpuTime_sec Nullable(Float64),
     tableName LowCardinality(String),
     context String CODEC(ZSTD(3)),
     sql String CODEC(ZSTD(3)),
