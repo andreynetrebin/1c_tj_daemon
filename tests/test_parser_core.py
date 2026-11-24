@@ -433,7 +433,7 @@ class TestEdgeCases:
 
     def test_ch_insert_failure(self, multi_event_file, mock_ch_loader):
         mock_ch_loader.set_fail_mode(True)
-        events_count, _, _, _ = parse_file(
+        events_count, last_line, _, is_complete = parse_file(
             multi_event_file, "test_dir", mock_ch_loader,
             batch_size=100, start_line=0
         )
