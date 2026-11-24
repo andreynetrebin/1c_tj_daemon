@@ -205,7 +205,7 @@ class TestParserWithClickHouse:
         assert event['event_name'] == 'SDBL'
         assert event['p_processName'] == 'test_app'
         assert event['t_computerName'] == 'Server1C'
-        assert event['t_connectID'] == '100'
+        assert event['t_connectID'] == 100
         assert event['usr'] == 'TestUser'
         assert event['func'] == 'BeginTransaction'
 
