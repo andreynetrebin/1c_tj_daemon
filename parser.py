@@ -489,6 +489,9 @@ def parse_file(file_path: Path, directory_name: str,
     match_num = 0
     last_line_number = start_line  # 🔧 Инициализируем start_line
     last_event_timestamp = None
+    committed_line = start_line
+    committed_events = 0
+    committed_ts = None
 
     lines_skipped = 0
     lines_processed = 0
@@ -545,8 +548,11 @@ def parse_file(file_path: Path, directory_name: str,
                                 batch.append(event)
                                 events_count += 1
                                 if len(batch) >= batch_size:
-                                    if ch_loader.insert_batch(batch):
-                                        logger.debug(f"✅ Батч {len(batch)} вставлен")
+                                    if not ch_loader.insert_batch(batch):
+                                        return (committed_events, committed_line, committed_ts, False)
+                                    committed_events += len(batch)
+                                    committed_line = line_number - 1
+                                    committed_ts = last_event_timestamp
                                     batch = []
                                     gc.collect()
                         except Exception as e:
@@ -597,8 +603,8 @@ def parse_file(file_path: Path, directory_name: str,
 
         # 🔧 Вставка остатка
         if batch:
-            if ch_loader.insert_batch(batch):
-                logger.debug(f"✅ Финальный батч {len(batch)} вставлен")
+            if not ch_loader.insert_batch(batch):
+                return (committed_events, committed_line, committed_ts, False)
             batch = []
             gc.collect()
 
@@ -616,7 +622,7 @@ def parse_file(file_path: Path, directory_name: str,
 
     except Exception as e:
         logger.error(f"❌ Ошибка парсинга {file_path}: {e}")
-        return (0, start_line, None, False)
+        return (committed_events, committed_line, committed_ts, False)
 
 
 
@@ -709,6 +715,8 @@ class TJLogDaemon:
         errors = 0
 
         for file_path, directory_name in self._find_new_files():
+            if self._shutdown:
+                break
             files_found += 1
             try:
                 start_line = self.state.get_last_line_number(file_path)
