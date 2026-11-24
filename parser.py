@@ -124,7 +124,9 @@ class ClickHouseLoader:
                 dbpid Nullable(UInt16),
                 osThread Nullable(UInt32),
                 sessionID String,
-                sessionID_main Nullable(UInt64) ALIAS accurateCastOrNull(extract(sessionID, '^([0-9]+)(?:[(][0-9]+[)])?
+
+                sessionID_main Nullable(UInt64) ALIAS accurateCastOrNull(extract(sessionID, '^([0-9]+)(?:[(][0-9]+[)])?$'), 'UInt64'),
+                sessionID_extra Nullable(UInt64) ALIAS accurateCastOrNull(extract(sessionID, '^[0-9]+[(]([0-9]+)[)]$'), 'UInt64'),
                 trans Nullable(UInt8),
                 func LowCardinality(String),
                 module LowCardinality(String),
@@ -177,7 +179,7 @@ class ClickHouseLoader:
                     e.get('directory_name', ''),
                     e.get('source_file', ''),
                     int(e.get('line_number', 0) or 0),
-                    datetime.now(),
+                    datetime.now(MOSCOW_TZ),
                     e.get('event_name', ''),
                     int(e.get('level', 0) or 0),
                     float(e.get('duration_sec', 0) or 0),
@@ -522,7 +524,7 @@ def parse_file(file_path: Path, directory_name: str,
 
                             microsec = microseconds.ljust(6, '0')[:6]
                             event_timestamp = base_date.replace(
-                                minute=minute, second=second, microsecond=int(microsec)
+                                minute=minute, second=second, microsecond=int(microsec), tzinfo=MOSCOW_TZ
                             )
 
                             last_event_timestamp = event_timestamp
