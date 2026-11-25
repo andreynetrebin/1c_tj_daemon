@@ -10,6 +10,7 @@ import signal
 import logging
 import re
 import gc
+import codecs
 import chardet
 import clickhouse_connect
 from datetime import datetime, timedelta
@@ -284,7 +285,12 @@ def _detect_encoding(fp: Path) -> str:
         with open(fp, 'rb') as f:
             raw = f.read(10000)
             if raw.startswith(UTF8_BOM):
-                raw = raw[3:]
+                return 'utf-8'
+            try:
+                codecs.getincrementaldecoder('utf-8')().decode(raw, final=False)
+                return 'utf-8'
+            except UnicodeDecodeError:
+                pass
             result = chardet.detect(raw)
             if result and result['confidence'] > 0.7:
                 enc = result['encoding']
@@ -439,6 +445,7 @@ class StreamingProperties:
         self.props = {}
         self.key = None
         self.quote = None
+        self.pending_quote = False
         self.parts = []
         self.size = 0
         self.retained = 0
@@ -479,7 +486,17 @@ class StreamingProperties:
         self._reset()
 
     def feed(self, text):
+        if not text:
+            return
         i = 0
+        if self.pending_quote:
+            self.pending_quote = False
+            if text[0] == self.quote:
+                self._append(text, 0, 1)
+                i = 1
+            else:
+                self._append(self.quote, 0, 1)
+                self.quote = None
         end = len(text)
         while i < end:
             if self.quote is not None:
@@ -488,7 +505,10 @@ class StreamingProperties:
                     self._append(text, i, end)
                     return
                 self._append(text, i, j)
-                if j + 1 < end and text[j + 1] == self.quote:
+                if j + 1 == end:
+                    self.pending_quote = True
+                    return
+                if text[j + 1] == self.quote:
                     self._append(text, j, j + 1)
                     i = j + 2
                 else:
@@ -513,6 +533,10 @@ class StreamingProperties:
             i = j + 1
 
     def finish(self):
+        if self.pending_quote:
+            self._append(self.quote, 0, 1)
+            self.pending_quote = False
+            self.quote = None
         if self.key and self.size:
             self._store()
         return self.props
@@ -579,15 +603,18 @@ def _build_event(timestamp: datetime, event_name: str, level: int,
 def parse_file(file_path: Path, directory_name: str,
                ch_loader: ClickHouseLoader, batch_size: int,
                start_line: int = 0, *, checkpoint=None,
-               batch_max_bytes=None, max_line_bytes=None, should_stop=None
+               batch_max_bytes=None, max_line_bytes=None, should_stop=None,
+               read_chunk_bytes=None, single_event_max_bytes=None, on_error=None
                ) -> Tuple[int, int, Optional[datetime], bool]:
     """Stream complete events; checkpoint only after acknowledged inserts."""
     logger.info("Parsing %s (dir: %s, start_line: %d)", file_path.name, directory_name, start_line)
     batch_max_bytes = (getattr(settings, 'parser_batch_max_bytes', 16 * 1024 * 1024)
                        if batch_max_bytes is None else batch_max_bytes)
-    max_line_bytes = (getattr(settings, 'parser_max_line_bytes', 8 * 1024 * 1024)
-                      if max_line_bytes is None else max_line_bytes)
-    if min(batch_size, batch_max_bytes, max_line_bytes) <= 0:
+    read_chunk_bytes = (getattr(settings, 'parser_read_chunk_bytes', 65536)
+                        if read_chunk_bytes is None else read_chunk_bytes)
+    single_event_max_bytes = (getattr(settings, 'parser_single_event_max_bytes', 128 * 1024 * 1024)
+                              if single_event_max_bytes is None else single_event_max_bytes)
+    if min(batch_size, batch_max_bytes, read_chunk_bytes, single_event_max_bytes) <= 0 or (max_line_bytes is not None and max_line_bytes <= 0):
         raise ValueError('Parser limits must be positive')
     encoding = _detect_encoding(file_path)
     base_date = _parse_date_from_filename(str(file_path))
@@ -645,9 +672,10 @@ def parse_file(file_path: Path, directory_name: str,
                           for v in event.values())
         if batch and (len(batch) >= batch_size or batch_bytes + size > batch_max_bytes):
             flush()
+        if size > single_event_max_bytes:
+            raise ValueError('Event exceeds single-event budget at line %d; largest fields: %s' % (event_start, sorted(((k, len(v)) for k, v in event.items() if isinstance(v, str)), key=lambda x: -x[1])[:5]))
         if size > batch_max_bytes:
-            # Do not silently truncate non-text fields or skip this event.
-            raise ValueError('Event exceeds batch byte budget at line %d' % event_start)
+            logger.info('Large single event %s:%d, estimated %d bytes', file_path.name, event_start, size)
         batch.append(event)
         batch_bytes += size
         batch_end = end_line
@@ -657,39 +685,68 @@ def parse_file(file_path: Path, directory_name: str,
     try:
         with open(file_path, 'rb', buffering=1048576) as f:
             line_number = 0
+            at_start = True
+            decoder = None
+            pending_cr = b''
+            line_size = 0
             while True:
                 if should_stop is not None and should_stop():
                     flush()
                     return (committed_events, committed_line, committed_ts, False)
-                raw = f.readline(max_line_bytes + 1)
+                raw = f.readline(read_chunk_bytes)
                 if not raw:
+                    if decoder is not None and stream is not None and line_number > start_line:
+                        stream.feed(decoder.decode(pending_cr, final=True))
                     break
-                line_number += 1
-                if len(raw) > max_line_bytes:
+                first = at_start
+                if first:
+                    line_number += 1
+                    line_size = 0
+                line_size += len(raw)
+                at_start = raw.endswith(b'\n')
+                if max_line_bytes is not None and line_size > max_line_bytes:
                     raise ValueError('Physical line exceeds configured limit at line %d' % line_number)
                 if line_number <= start_line:
                     continue
                 last_line = line_number
                 raw_size = len(raw)
-                if line_number == 1 and raw.startswith(UTF8_BOM):
-                    raw = raw[len(UTF8_BOM):]
-                match = EVENT_HEADER_PATTERN.match(raw)
-                if match:
-                    finish_event(line_number - 1)
-                    header = match.groups()[:6]
-                    stream = StreamingProperties()
-                    event_start = line_number
-                    event_bytes = raw_size
-                    stream.feed(match.group(7).decode(encoding, errors='replace'))
-                elif stream is not None:
+                if first:
+                    decoder = codecs.getincrementaldecoder(encoding)(errors='replace')
+                    pending_cr = b''
+                    if line_number == 1 and raw.startswith(UTF8_BOM):
+                        raw = raw[len(UTF8_BOM):]
+                    match = EVENT_HEADER_PATTERN.match(raw)
+                    if match:
+                        finish_event(line_number - 1)
+                        header = match.groups()[:6]
+                        stream = StreamingProperties(max_retained_chars=max(1, single_event_max_bytes // 8))
+                        event_start = line_number
+                        event_bytes = 0
+                        # Use original bytes after header, not group(7), to keep
+                        # newline handling identical for split and unsplit lines.
+                        raw = raw[match.start(7):]
+                    elif stream is not None:
+                        stream.feed('\n')
+                if stream is not None:
                     event_bytes += raw_size
-                    stream.feed('\n' + raw.rstrip(b'\n\r').decode(encoding, errors='replace'))
+                    data = pending_cr + raw
+                    pending_cr = b''
+                    if at_start:
+                        data = data.rstrip(b'\r\n')
+                    elif data.endswith(b'\r'):
+                        data = data[:-1]
+                        pending_cr = b'\r'
+                    stream.feed(decoder.decode(data, final=at_start))
+                if at_start:
+                    decoder = None
         finish_event(last_line)
         flush()
         logger.info("%s: %d events, lines %d-%d", file_path.name, committed_events,
                     start_line + 1, last_line)
         return (committed_events, last_line, committed_ts, last_line == start_line)
-    except Exception:
+    except Exception as exc:
+        if on_error is not None:
+            on_error(exc)
         logger.exception("Parsing stopped for %s at line %d; confirmed line %d",
                          file_path, last_line, committed_line)
         return (committed_events, committed_line, committed_ts, False)
@@ -794,9 +851,11 @@ class TJLogDaemon:
                     self.state.mark_processed(file_path, count, last_line_number=line,
                                               last_event_timestamp=timestamp, is_complete=False)
 
+                parse_errors = []
                 events, last_line, last_ts, is_complete = parse_file(
                     file_path, directory_name, self.ch_loader, self.batch_size, start_line,
-                    checkpoint=save_checkpoint, should_stop=lambda: self._shutdown
+                    checkpoint=save_checkpoint, should_stop=lambda: self._shutdown,
+                    on_error=parse_errors.append
                 )
 
                 # Batch event counts were already persisted. Only finalize position.
@@ -806,9 +865,13 @@ class TJLogDaemon:
                         last_event_timestamp=last_ts, is_complete=is_complete
                     )
 
-                if events >= 0 or last_line > 0:
+                total_events += events
+                if parse_errors:
+                    errors += 1
+                    self.state.update_scan(stats_id, errors_count=errors,
+                                           error_message=str(parse_errors[0])[:500])
+                elif not self._shutdown:
                     files_processed += 1
-                    total_events += events
 
             except Exception as e:
                 logger.error(f"❌ Ошибка обработки {file_path}: {e}")
