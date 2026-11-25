@@ -78,3 +78,56 @@ def test_stop_does_not_commit_partial_event(tmp_path):
     result = parse_file(path, "test", loader, 100, should_stop=stop)
     assert result == (0, 0, None, False)
     loader.insert_batch.assert_not_called()
+
+
+def test_chunk_split_quotes():
+    raw = "Context='а''б,в',Rows=17,Locks='foo''bar'"
+    for size in range(1, len(raw) + 1):
+        stream = StreamingProperties()
+        for offset in range(0, len(raw), size):
+            stream.feed(raw[offset:offset + size])
+        assert stream.finish() == _parse_props(raw)
+
+
+def test_long_physical_line(tmp_path):
+    path = tmp_path / "26112417.log"
+    with path.open("wb") as f:
+        f.write(b"\xef\xbb\xbf17:52.299004-1,SDBL,3,Sdbl='")
+        for _ in range(160):
+            f.write("я".encode() * 32768)
+        f.write(b"',Rows=17,Context='tail'\r\n")
+        f.write(b"18:00.000001-1,CALL,1,Module=M,Method=F\n")
+    loader = Mock()
+    loader.insert_batch.return_value = True
+    result = parse_file(path, "test", loader, 100, read_chunk_bytes=65537)
+    assert result[:2] == (2, 2)
+    rows = loader.insert_batch.call_args.args[0]
+    assert rows[0]["sdbl"] == "я" * 100000
+    assert rows[0]["rows"] == 17
+    assert rows[0]["context"].startswith("tail")
+    assert rows[1]["line_number"] == 2
+
+
+def test_single_large_event(tmp_path):
+    path = tmp_path / "26112417.log"
+    path.write_bytes(b"17:52.299004-1,TLOCK,1,Locks=" + b"x" * 40000 +
+                     b"\n18:00.000001-1,CALL,1,Module=M\n")
+    loader = Mock()
+    loader.insert_batch.return_value = True
+    result = parse_file(path, "test", loader, 100, batch_max_bytes=100000,
+                        single_event_max_bytes=1000000)
+    assert result[:2] == (2, 2)
+    assert len(loader.insert_batch.call_args_list) == 2
+    assert loader.insert_batch.call_args_list[0].args[0][0]["locks"] == "x" * 40000
+
+
+def test_single_event_hard_limit_reports_error(tmp_path):
+    path = tmp_path / "26112417.log"
+    path.write_bytes(b"17:52.299004-1,TLOCK,1,Locks=" + b"x" * 40000 + b"\n")
+    loader = Mock()
+    errors = []
+    result = parse_file(path, "test", loader, 100, batch_max_bytes=100000,
+                        single_event_max_bytes=200000, on_error=errors.append)
+    assert result[:2] == (0, 0)
+    assert len(errors) == 1
+    loader.insert_batch.assert_not_called()
