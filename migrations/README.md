@@ -2,7 +2,7 @@
 
 ## Подготовка
 
-- Выполнить 001_create_v2.sql и 002_create_view.sql, если объекты ещё не созданы.
+- Для новой установки выполнить 001_create_v2.sql и 002_create_view.sql. Для действующей v2 с cpuTime в микросекундах использовать 003_cpu_time_seconds.sql до запуска нового парсера.
 - Проверить SHOW CREATE TABLE и DESCRIBE TABLE для v2 и all. IF NOT EXISTS не исправляет уже существующую схему.
 - Запустить python -m py_compile parser.py и python -m pytest -v.
 - Убедиться, что каталоги с CALL входят в список watch_dirs в TJLogDaemon, а регистрация CALL включена на сервере 1С.
@@ -47,22 +47,28 @@ MergeTree не гарантирует exactly-once: сбой после успе
 - Сырые многострочные события больше не объединяются в одну строку.
 - Context, Sql/SQL, Sdbl, planSQLText, Exception, Data ограничены 100000 символами во время чтения. Состояние кавычек сохраняется, поэтому свойства после длинного SQL продолжают разбираться.
 - Сокращение фиксируется WARNING с именем файла, начальной строкой, размером исходного события и списком полей. Исходный журнал не изменяется; сохраняйте его до окончания проверки.
-- Пакет ограничен количеством событий и консервативной оценкой объёма памяти. Слишком большая физическая строка или непомещающееся поле без разрешённого сокращения вызывает диагностическую ошибку без продвижения позиции за проблемное событие.
+- Пакет ограничен количеством событий и консервативной оценкой объёма памяти. Физические строки читаются фрагментами с инкрементальным декодированием и сохранением состояния кавычек. Крупные события отправляются отдельным INSERT. При превышении защитного бюджета одиночного события или несокращаемого свойства (включая Locks) обработка файла останавливается без продвижения за неподтверждённое событие; ошибка учитывается в статистике.
 - SQLite обновляется после каждого подтверждённого пакета. Сбой между вставкой и записью SQLite по-прежнему может вызвать повтор.
-- Настройки по умолчанию работают даже со старым Linux config.py; для настройки через .env добавьте в серверный класс Settings поля parser_batch_max_bytes и parser_max_line_bytes из config.py, не заменяя Linux-пути Windows-путями.
+- Настройки по умолчанию работают даже со старым Linux config.py; для настройки через .env добавьте в серверный класс Settings поля parser_batch_max_bytes, parser_read_chunk_bytes и parser_single_event_max_bytes из config.py, не заменяя Linux-пути Windows-путями.
 
-Рекомендуемые начальные настройки:
+Проверенные настройки PROD (25.11.2026):
 
 ```ini
 PARSER_BATCH_SIZE=1000
 PARSER_BATCH_MAX_BYTES=16777216
-PARSER_MAX_LINE_BYTES=8388608
+PARSER_READ_CHUNK_BYTES=65536
+PARSER_SINGLE_EVENT_MAX_BYTES=536870912
 PARSER_IGNORE_ACTIVE_LOGS=true
 ```
 
-Проверка: python -m pytest tests/test_streaming_parser.py -v, затем весь набор тестов. На PROD сначала проверить отсутствие уже загруженных строк проблемного файла и сохранённый checkpoint, затем развернуть parser.py при остановленной службе. Не сбрасывать SQLite. Следить за MemoryCurrent/MemoryPeak и журналом systemd. Новые колонки метрик размера события не обязательны и в данном изменении не добавлены.
+Проверка: python -m pytest tests/test_streaming_parser.py -v, затем весь набор тестов. На PROD сначала проверить отсутствие уже загруженных строк проблемного файла и сохранённый checkpoint, затем развернуть parser.py при остановленной службе. Не сбрасывать SQLite. Следить за VmRSS/VmHWM процесса, memory.events, memory.stat cgroup и журналом systemd. MemoryCurrent/MemoryPeak включают файловый кеш; бюджет одиночного события является оценкой, а не гарантией RSS. Новые колонки метрик размера события не обязательны и в данном изменении не добавлены.
 
 
 ## CPU time in seconds
 
 Fresh installations use updated 001/002. Existing v2 installations with legacy cpuTime Nullable(UInt64) must stop the daemon, verify the old column contains microseconds only, then run 003_cpu_time_seconds.sql before deploying the new parser. Existing raw cpuTime is retained; cpuTime_sec is Nullable(Float64), computed from the old column for historical parts and explicitly inserted for new events. Do not rerun a materialization after deploying new code without reviewing ClickHouse version semantics. Update analytics to cpuTime_sec. Do not use old parser against a fresh seconds-only schema. Do not remove the legacy column while the DEFAULT references it.
+
+
+## Результаты приёмки 25.11.2026
+
+По журналам и SQL-проверкам оператора: 129 тестов прошли (7,38 с, одно предупреждение SQLAlchemy); файл 2,4 GiB — 41 событие, 41 уникальная начальная строка; после увеличения бюджета до 512 MiB цикл из 15 файлов завершён с 83 102 событиями и 0 ошибок за 413,8 с. VmHWM процесса 389160 KiB, VmRSS 98940 KiB, VmSwap 0. Среди CALL, загруженных после 09:24:05 MSK, 4742 из 4742 имеют cpuTime_sec, старый cpuTime NULL у всех. В проверенной выборке новых вставок дубликатов нет (не является гарантией exactly-once или отсутствия пересечений с историей). Сохранять лимит systemd 4 GiB. Не удалять исходные журналы до подтверждения загрузки. Прежний CPU-столбец не удалять, пока на него ссылается DEFAULT.
