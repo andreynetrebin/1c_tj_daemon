@@ -10,6 +10,7 @@ import signal
 import logging
 import re
 import gc
+import codecs
 import chardet
 import clickhouse_connect
 from datetime import datetime, timedelta
@@ -109,30 +110,40 @@ class ClickHouseLoader:
         self.client.command(f"""
             CREATE TABLE IF NOT EXISTS {db}.{quoted}
             (
-                timestamp DateTime64(6, 'Europe/Moscow'),
+                timestamp DateTime64(6, 'Europe/Moscow') CODEC(Delta(8), ZSTD(1)),
                 directory_name LowCardinality(String),
                 source_file String,
-                line_number UInt64,
-                loaded_at DateTime64(6, 'Europe/Moscow'),
+                line_number UInt64 CODEC(ZSTD(1)),
+                loaded_at DateTime64(6, 'Europe/Moscow') CODEC(Delta(8), ZSTD(1)),
                 event_name LowCardinality(String),
                 level UInt8,
-                duration_ms Float32,
+                duration_sec Float64,
                 p_processName LowCardinality(String),
                 t_computerName String,
-                t_connectID String,
+                t_connectID Nullable(UInt32),
                 usr LowCardinality(String),
-                dbpid String,
-                osThread String,
+                dbpid Nullable(UInt16),
+                osThread Nullable(UInt32),
                 sessionID String,
-                trans String,
-                func String,
+
+                sessionID_main Nullable(UInt64) ALIAS accurateCastOrNull(extract(sessionID, '^([0-9]+)(?:[(][0-9]+[)])?$'), 'UInt64'),
+                sessionID_extra Nullable(UInt64) ALIAS accurateCastOrNull(extract(sessionID, '^[0-9]+[(]([0-9]+)[)]$'), 'UInt64'),
+                trans Nullable(UInt8),
+                func LowCardinality(String),
+                module LowCardinality(String),
+                method LowCardinality(String),
+                memory Nullable(Int64),
+                memoryPeak Nullable(UInt64),
+                inBytes Nullable(UInt64),
+                outBytes Nullable(UInt64),
+                cpuTime_sec Nullable(Float64),
                 tableName LowCardinality(String),
                 context String CODEC(ZSTD(3)),
                 sql String CODEC(ZSTD(3)),
                 sdbl String CODEC(ZSTD(3)),
                 planSQLText String CODEC(ZSTD(3)),
                 exception String CODEC(ZSTD(3)),
-                locks String,
+                locks String CODEC(ZSTD(3)),
                 waitConnections String,
                 deadlockConnectionIntersections String,
                 lkaid String,
@@ -140,23 +151,20 @@ class ClickHouseLoader:
                 lkp String,
                 lkpid String,
                 lksrc String,
-                rows String,
-                rowsAffected String,
+                rows Nullable(UInt64),
+                rowsAffected Nullable(Int64),
                 description String,
                 data String CODEC(ZSTD(3)),
                 severity LowCardinality(String),
                 category LowCardinality(String),
-                mssql_error_code Nullable(UInt32),
-                INDEX idx_ts timestamp TYPE minmax GRANULARITY 8192,
                 INDEX idx_en event_name TYPE bloom_filter GRANULARITY 8192,
-                INDEX idx_usr usr TYPE bloom_filter GRANULARITY 8192,
-                INDEX idx_err mssql_error_code TYPE set(100) GRANULARITY 8192
+                INDEX idx_usr usr TYPE bloom_filter GRANULARITY 8192
             )
             ENGINE = MergeTree()
-            PARTITION BY toYYYYMM(timestamp)
+            PARTITION BY toDate(timestamp)
             ORDER BY (timestamp, event_name)
-            TTL timestamp + INTERVAL 90 DAY
-            SETTINGS index_granularity = 8192
+            TTL timestamp + INTERVAL 30 DAY
+            SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1
         """)
         logger.info(f"✅ Таблица {db}.{quoted} готова")
 
@@ -172,19 +180,26 @@ class ClickHouseLoader:
                     e.get('directory_name', ''),
                     e.get('source_file', ''),
                     int(e.get('line_number', 0) or 0),
-                    datetime.now(),
+                    datetime.now(MOSCOW_TZ),
                     e.get('event_name', ''),
                     int(e.get('level', 0) or 0),
-                    float(e.get('duration_ms', 0) or 0),
+                    float(e.get('duration_sec', 0) or 0),
                     e.get('p_processName', ''),
                     e.get('t_computerName', ''),
-                    e.get('t_connectID', ''),
+                    e.get('t_connectID'),
                     e.get('usr', ''),
-                    e.get('dbpid', ''),
-                    e.get('osThread', ''),
+                    e.get('dbpid'),
+                    e.get('osThread'),
                     e.get('sessionID', ''),
-                    e.get('trans', ''),
+                    e.get('trans'),
                     e.get('func', ''),
+                    e.get('module', ''),
+                    e.get('method', ''),
+                    e.get('memory'),
+                    e.get('memoryPeak'),
+                    e.get('inBytes'),
+                    e.get('outBytes'),
+                    e.get('cpuTime_sec'),
                     e.get('tableName', ''),
                     (e.get('context') or '')[:100000],
                     (e.get('sql') or '')[:100000],
@@ -199,13 +214,12 @@ class ClickHouseLoader:
                     e.get('lkp', ''),
                     e.get('lkpid', ''),
                     e.get('lksrc', ''),
-                    e.get('rows', ''),
-                    e.get('rowsAffected', ''),
+                    e.get('rows'),
+                    e.get('rowsAffected'),
                     e.get('description', ''),
                     (e.get('data') or '')[:100000],
                     e.get('severity', 'info'),
                     e.get('category', 'other'),
-                    e.get('mssql_error_code')
                 ])
 
             self.client.insert(
@@ -213,12 +227,13 @@ class ClickHouseLoader:
                 data=rows,
                 column_names=[
                     'timestamp', 'directory_name', 'source_file', 'line_number', 'loaded_at',
-                    'event_name', 'level', 'duration_ms', 'p_processName', 't_computerName',
+                    'event_name', 'level', 'duration_sec', 'p_processName', 't_computerName',
                     't_connectID', 'usr', 'dbpid', 'osThread', 'sessionID', 'trans', 'func',
+                    'module', 'method', 'memory', 'memoryPeak', 'inBytes', 'outBytes', 'cpuTime_sec',
                     'tableName', 'context', 'sql', 'sdbl', 'planSQLText', 'exception',
                     'locks', 'waitConnections', 'deadlockConnectionIntersections',
                     'lkaid', 'lka', 'lkp', 'lkpid', 'lksrc', 'rows', 'rowsAffected',
-                    'description', 'data', 'severity', 'category', 'mssql_error_code'
+                    'description', 'data', 'severity', 'category'
                 ]
             )
             logger.debug(f"✅ Вставлено {len(rows)} событий")
@@ -238,20 +253,30 @@ class ClickHouseLoader:
 # 🔧 ПАРСЕР ФАЙЛОВ
 # ============================================================================
 
-def _extract_mssql_error_code(text: str) -> Optional[int]:
-    """Извлечь код ошибки MSSQL из текста"""
-    if not text:
+def _nullable_int(value, type_name):
+    """Convert integer properties, preserving NULL and guarding overflow."""
+    if value is None or not str(value).strip():
         return None
-    native_match = re.search(r'native=(\d+)', text, re.IGNORECASE)
-    if native_match:
-        return int(native_match.group(1))
-    error_match = re.search(r'Error[:\s]+(\d+)', text, re.IGNORECASE)
-    if error_match:
-        return int(error_match.group(1))
-    state_match = re.search(r'SQLState[=:]?(\d{5})', text, re.IGNORECASE)
-    if state_match:
-        return int(state_match.group(1))
+    raw = str(value).strip()
+    signed = type_name.startswith('Int')
+    bits = int(type_name.replace('UInt', '').replace('Int', ''))
+    try:
+        if not re.fullmatch(r'[+-]?[0-9]+', raw):
+            raise ValueError('not an integer')
+        number = int(raw)
+        low = -(1 << (bits - 1)) if signed else 0
+        high = (1 << (bits - int(signed))) - 1
+        if low <= number <= high:
+            return number
+    except ValueError:
+        pass
+    logger.warning('Invalid %s TJ property: %r', type_name, raw[:100])
     return None
+
+
+def _cpu_seconds(value):
+    micros = _nullable_int(value, 'UInt64')
+    return None if micros is None else micros / 1_000_000
 
 
 def _detect_encoding(fp: Path) -> str:
@@ -260,7 +285,12 @@ def _detect_encoding(fp: Path) -> str:
         with open(fp, 'rb') as f:
             raw = f.read(10000)
             if raw.startswith(UTF8_BOM):
-                raw = raw[3:]
+                return 'utf-8'
+            try:
+                codecs.getincrementaldecoder('utf-8')().decode(raw, final=False)
+                return 'utf-8'
+            except UnicodeDecodeError:
+                pass
             result = chardet.detect(raw)
             if result and result['confidence'] > 0.7:
                 enc = result['encoding']
@@ -391,23 +421,133 @@ def _parse_props(prop_str: str) -> Dict[str, str]:
     return props
 
 
+
+# Keep the existing text-field storage policy, but apply it during parsing.
+_TRUNCATED_PROPERTIES = {'Context', 'Sql', 'SQL', 'Sdbl', 'planSQLText', 'Exception', 'Data'}
+_STORED_PROPERTIES = _TRUNCATED_PROPERTIES | {
+    'p:processName', 't:computerName', 't:connectID', 'Usr', 'dbpid',
+    'OSThread', 'SessionID', 'Trans', 'Func', 'Module', 'Method', 'Memory',
+    'MemoryPeak', 'InBytes', 'OutBytes', 'CpuTime', 'tableName', 'Locks',
+    'WaitConnections', 'DeadlockConnectionIntersections', 'lkaid', 'lka',
+    'lkp', 'lkpid', 'lksrc', 'Rows', 'RowsAffected', 'Description'
+}
+_KEY_TOKEN = re.compile(r"""['",=]""")
+_VALUE_TOKEN = re.compile(r"""['",]""")
+
+
+class StreamingProperties:
+    """Bound retained text independently of the raw event size.
+
+    feed() receives one physical line (or its header properties), with newline
+    separators supplied by parse_file. The quote rules match the legacy parser.
+    """
+    def __init__(self, max_retained_chars=8 * 1024 * 1024):
+        self.props = {}
+        self.key = None
+        self.quote = None
+        self.pending_quote = False
+        self.parts = []
+        self.size = 0
+        self.retained = 0
+        self.max_retained = max_retained_chars
+        self.truncated = set()
+
+    def _append(self, text, start, end):
+        if start == end:
+            return
+        if self.key is not None and self.key not in _STORED_PROPERTIES:
+            return
+        limit = (1024 if self.key is None else
+                 100000 if self.key in _TRUNCATED_PROPERTIES else self.max_retained)
+        remaining = min(limit - self.size, self.max_retained - self.retained - self.size)
+        length = end - start
+        if length > remaining:
+            if self.key not in _TRUNCATED_PROPERTIES:
+                raise ValueError('Retained property limit exceeded: %r' % self.key)
+            self.truncated.add(self.key)
+        take = min(length, max(0, remaining))
+        if take:
+            self.parts.append(text[start:start + take])
+            self.size += take
+
+    def _reset(self):
+        self.parts = []
+        self.size = 0
+
+    def _store(self):
+        if self.key in _STORED_PROPERTIES:
+            value = ''.join(self.parts).strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            self.retained -= len(self.props.get(self.key, ''))
+            self.props[self.key] = value
+            self.retained += len(value)
+        self.key = None
+        self._reset()
+
+    def feed(self, text):
+        if not text:
+            return
+        i = 0
+        if self.pending_quote:
+            self.pending_quote = False
+            if text[0] == self.quote:
+                self._append(text, 0, 1)
+                i = 1
+            else:
+                self._append(self.quote, 0, 1)
+                self.quote = None
+        end = len(text)
+        while i < end:
+            if self.quote is not None:
+                j = text.find(self.quote, i)
+                if j < 0:
+                    self._append(text, i, end)
+                    return
+                self._append(text, i, j)
+                if j + 1 == end:
+                    self.pending_quote = True
+                    return
+                if text[j + 1] == self.quote:
+                    self._append(text, j, j + 1)
+                    i = j + 2
+                else:
+                    self._append(text, j, j + 1)
+                    self.quote = None
+                    i = j + 1
+                continue
+            token = (_KEY_TOKEN if self.key is None else _VALUE_TOKEN).search(text, i)
+            if token is None:
+                self._append(text, i, end)
+                return
+            j = token.start()
+            self._append(text, i, j)
+            c = text[j]
+            if c in "\"'":
+                self.quote = c
+            elif c == '=' and self.key is None:
+                self.key = ''.join(self.parts).strip()
+                self._reset()
+            elif c == ',' and self.key:
+                self._store()
+            i = j + 1
+
+    def finish(self):
+        if self.pending_quote:
+            self._append(self.quote, 0, 1)
+            self.pending_quote = False
+            self.quote = None
+        if self.key and self.size:
+            self._store()
+        return self.props
+
+
 def _build_event(timestamp: datetime, event_name: str, level: int,
                  duration: int, props_str: str, line_num: int,
                  file_path: Path, directory_name: str) -> Optional[Dict[str, Any]]:
     """Построить событие из сырых данных"""
     try:
-        props = _parse_props(props_str)
-        sdbl_text = props.get('Sdbl', '')
-        context_text = props.get('Context', '')
-        sql_text = props.get('Sql', props.get('SQL', ''))
-
-        mssql_error_code = None
-        for text_field in [sdbl_text, context_text, sql_text]:
-            if text_field:
-                mssql_error_code = _extract_mssql_error_code(text_field)
-                if mssql_error_code:
-                    break
-
+        props = props_str if isinstance(props_str, dict) else _parse_props(props_str)
         return {
             'timestamp': timestamp,
             'directory_name': directory_name,
@@ -415,16 +555,23 @@ def _build_event(timestamp: datetime, event_name: str, level: int,
             'line_number': line_num,
             'event_name': event_name,
             'level': level,
-            'duration_ms': duration / 1000000,
+            'duration_sec': duration / 1000000,
             'p_processName': props.get('p:processName', ''),
             't_computerName': props.get('t:computerName', ''),
-            't_connectID': props.get('t:connectID', ''),
+            't_connectID': _nullable_int(props.get('t:connectID'), 'UInt32'),
             'usr': props.get('Usr', ''),
-            'dbpid': props.get('dbpid', ''),
-            'osThread': props.get('OSThread', ''),
+            'dbpid': _nullable_int(props.get('dbpid'), 'UInt16'),
+            'osThread': _nullable_int(props.get('OSThread'), 'UInt32'),
             'sessionID': props.get('SessionID', ''),
-            'trans': props.get('Trans', ''),
+            'trans': _nullable_int(props.get('Trans'), 'UInt8'),
             'func': props.get('Func', ''),
+            'module': props.get('Module', ''),
+            'method': props.get('Method', ''),
+            'memory': _nullable_int(props.get('Memory'), 'Int64'),
+            'memoryPeak': _nullable_int(props.get('MemoryPeak'), 'UInt64'),
+            'inBytes': _nullable_int(props.get('InBytes'), 'UInt64'),
+            'outBytes': _nullable_int(props.get('OutBytes'), 'UInt64'),
+            'cpuTime_sec': _cpu_seconds(props.get('CpuTime')),
             'tableName': props.get('tableName', ''),
             'context': props.get('Context', '')[:100000],
             'sql': props.get('Sql', props.get('SQL', ''))[:100000],
@@ -439,13 +586,12 @@ def _build_event(timestamp: datetime, event_name: str, level: int,
             'lkp': props.get('lkp', ''),
             'lkpid': props.get('lkpid', ''),
             'lksrc': props.get('lksrc', ''),
-            'rows': props.get('Rows', ''),
-            'rowsAffected': props.get('RowsAffected', ''),
+            'rows': _nullable_int(props.get('Rows'), 'UInt64'),
+            'rowsAffected': _nullable_int(props.get('RowsAffected'), 'Int64'),
             'description': props.get('Description', ''),
             'data': props.get('Data', '')[:100000],
             'severity': 'info',
             'category': 'other',
-            'mssql_error_code': mssql_error_code
         }
     except Exception as e:
         logger.debug(f"Ошибка построения события: {e}")
@@ -456,154 +602,154 @@ def _build_event(timestamp: datetime, event_name: str, level: int,
 
 def parse_file(file_path: Path, directory_name: str,
                ch_loader: ClickHouseLoader, batch_size: int,
-               start_line: int = 0) -> Tuple[int, int, Optional[datetime], bool]:
-    """
-    Распарсить файл и вставить события в ClickHouse.
-    """
-    logger.info(f"📖 Парсинг: {file_path.name} (dir: {directory_name}, start_line: {start_line})")
-
+               start_line: int = 0, *, checkpoint=None,
+               batch_max_bytes=None, max_line_bytes=None, should_stop=None,
+               read_chunk_bytes=None, single_event_max_bytes=None, on_error=None
+               ) -> Tuple[int, int, Optional[datetime], bool]:
+    """Stream complete events; checkpoint only after acknowledged inserts."""
+    logger.info("Parsing %s (dir: %s, start_line: %d)", file_path.name, directory_name, start_line)
+    batch_max_bytes = (getattr(settings, 'parser_batch_max_bytes', 16 * 1024 * 1024)
+                       if batch_max_bytes is None else batch_max_bytes)
+    read_chunk_bytes = (getattr(settings, 'parser_read_chunk_bytes', 65536)
+                        if read_chunk_bytes is None else read_chunk_bytes)
+    single_event_max_bytes = (getattr(settings, 'parser_single_event_max_bytes', 128 * 1024 * 1024)
+                              if single_event_max_bytes is None else single_event_max_bytes)
+    if min(batch_size, batch_max_bytes, read_chunk_bytes, single_event_max_bytes) <= 0 or (max_line_bytes is not None and max_line_bytes <= 0):
+        raise ValueError('Parser limits must be positive')
     encoding = _detect_encoding(file_path)
     base_date = _parse_date_from_filename(str(file_path))
     if not base_date:
-        logger.warning(f"⚠️ Не удалось определить дату из имени файла: {file_path.name}")
         return (0, 0, None, False)
-
-    events_count = 0
     batch = []
-    current_header = None
-    current_lines = []
-    match_num = 0
-    last_line_number = start_line  # 🔧 Инициализируем start_line
-    last_event_timestamp = None
+    batch_bytes = 0
+    batch_end = start_line
+    committed_line = start_line
+    committed_events = 0
+    committed_ts = None
+    last_line = start_line
+    stream = None
+    header = None
+    event_start = 0
+    event_bytes = 0
 
-    lines_skipped = 0
-    lines_processed = 0
-    current_event_start_line = 0
+    def flush():
+        nonlocal batch, batch_bytes, committed_line, committed_events, committed_ts
+        if not batch:
+            return
+        if not ch_loader.insert_batch(batch):
+            raise RuntimeError('ClickHouse insert failed')
+        ts = batch[-1]['timestamp']
+        # The callback must persist the delta, not the cumulative event count.
+        if checkpoint is not None:
+            checkpoint(len(batch), batch_end, ts)
+        committed_line = batch_end
+        committed_events += len(batch)
+        committed_ts = ts
+        logger.debug("Inserted %d events, estimated %d bytes, checkpoint %d",
+                     len(batch), batch_bytes, committed_line)
+        batch = []
+        batch_bytes = 0
+
+    def finish_event(end_line):
+        nonlocal batch_bytes, batch_end
+        if stream is None:
+            return
+        minute, second, micro, duration, name, level = header
+        ts = base_date.replace(minute=int(minute), second=int(second),
+                               microsecond=int(micro.ljust(6, b'0')[:6]),
+                               tzinfo=MOSCOW_TZ)
+        event = _build_event(ts, name.decode(encoding, errors='replace'),
+                             int(level), int(duration), stream.finish(),
+                             event_start, file_path, directory_name)
+        if event is None:
+            raise ValueError('Cannot build event at line %d' % event_start)
+        if stream.truncated:
+            logger.warning("Truncated text fields in %s:%d (%d raw bytes, %d lines): %s",
+                           file_path.name, event_start, event_bytes,
+                           end_line - event_start + 1, ','.join(sorted(stream.truncated)))
+        # Conservative estimate includes Python string storage and encoded data.
+        size = 1024 + sum(8 * len(v) + 64 if isinstance(v, str) else 64
+                          for v in event.values())
+        if batch and (len(batch) >= batch_size or batch_bytes + size > batch_max_bytes):
+            flush()
+        if size > single_event_max_bytes:
+            raise ValueError('Event exceeds single-event budget at line %d; largest fields: %s' % (event_start, sorted(((k, len(v)) for k, v in event.items() if isinstance(v, str)), key=lambda x: -x[1])[:5]))
+        if size > batch_max_bytes:
+            logger.info('Large single event %s:%d, estimated %d bytes', file_path.name, event_start, size)
+        batch.append(event)
+        batch_bytes += size
+        batch_end = end_line
+        if len(batch) >= batch_size or batch_bytes >= batch_max_bytes:
+            flush()
 
     try:
         with open(file_path, 'rb', buffering=1048576) as f:
-            for line_number, line_bytes in enumerate(f, 1):
-                # 🔧 Пропускаем уже обработанные строки
+            line_number = 0
+            at_start = True
+            decoder = None
+            pending_cr = b''
+            line_size = 0
+            while True:
+                if should_stop is not None and should_stop():
+                    flush()
+                    return (committed_events, committed_line, committed_ts, False)
+                raw = f.readline(read_chunk_bytes)
+                if not raw:
+                    if decoder is not None and stream is not None and line_number > start_line:
+                        stream.feed(decoder.decode(pending_cr, final=True))
+                    break
+                first = at_start
+                if first:
+                    line_number += 1
+                    line_size = 0
+                line_size += len(raw)
+                at_start = raw.endswith(b'\n')
+                if max_line_bytes is not None and line_size > max_line_bytes:
+                    raise ValueError('Physical line exceeds configured limit at line %d' % line_number)
                 if line_number <= start_line:
-                    lines_skipped += 1
                     continue
-
-                if line_number == 1 and line_bytes.startswith(UTF8_BOM):
-                    line_bytes = line_bytes[len(UTF8_BOM):]
-
-                lines_processed += 1
-                last_line_number = line_number  # 🔧 Это номер строки В ФАЙЛЕ (1, 2, 3...)
-
-                header_match = EVENT_HEADER_PATTERN.match(line_bytes)
-
-                if header_match:
-                    if current_header:
-                        match_num += 1
-                        try:
-                            minute = int(current_header.group(1))
-                            second = int(current_header.group(2))
-                            microseconds = current_header.group(3).decode(encoding, errors='replace')
-                            duration = int(current_header.group(4).decode(encoding, errors='replace'))
-                            event_name = current_header.group(5).decode(encoding, errors='replace')
-                            level = int(current_header.group(6).decode(encoding, errors='replace'))
-                            properties_start = current_header.group(7).decode(encoding, errors='replace')
-
-                            microsec = microseconds.ljust(6, '0')[:6]
-                            event_timestamp = base_date.replace(
-                                minute=minute, second=second, microsecond=int(microsec)
-                            )
-
-                            last_event_timestamp = event_timestamp
-
-                            full_props = properties_start
-                            if current_lines:
-                                content_decoded = '\n'.join(
-                                    line.decode(encoding, errors='replace') for line in current_lines
-                                )
-                                full_props = properties_start + '\n' + content_decoded
-
-                            # 🔧 ИСПРАВЛЕНИЕ: используем current_event_start_line
-                            event = _build_event(
-                                event_timestamp, event_name, level, duration,
-                                full_props, current_event_start_line, file_path, directory_name
-                            )
-                            if event:
-                                batch.append(event)
-                                events_count += 1
-                                if len(batch) >= batch_size:
-                                    if ch_loader.insert_batch(batch):
-                                        logger.debug(f"✅ Батч {len(batch)} вставлен")
-                                    batch = []
-                                    gc.collect()
-                        except Exception as e:
-                            logger.debug(f"❌ Ошибка парсинга события #{match_num}: {e}")
-
-                    current_header = header_match
-                    current_lines = []
-                    current_event_start_line = line_number  # ← ДОБАВИТЬ ЭТУ СТРОКУ
-                elif current_header:
-                    current_lines.append(line_bytes.rstrip(b'\n\r'))
-
-        # 🔧 Обработка последнего события
-        if current_header:
-            match_num += 1
-            try:
-                minute = int(current_header.group(1))
-                second = int(current_header.group(2))
-                microseconds = current_header.group(3).decode(encoding, errors='replace')
-                duration = int(current_header.group(4).decode(encoding, errors='replace'))
-                event_name = current_header.group(5).decode(encoding, errors='replace')
-                level = int(current_header.group(6).decode(encoding, errors='replace'))
-                properties_start = current_header.group(7).decode(encoding, errors='replace')
-
-                microsec = microseconds.ljust(6, '0')[:6]
-                event_timestamp = base_date.replace(
-                    minute=minute, second=second, microsecond=int(microsec)
-                )
-
-                last_event_timestamp = event_timestamp
-
-                full_props = properties_start
-                if current_lines:
-                    content_decoded = '\n'.join(
-                        line.decode(encoding, errors='replace') for line in current_lines
-                    )
-                    full_props = properties_start + '\n' + content_decoded
-
-                # 🔧 ВАЖНО: line_number — это номер строки В ФАЙЛЕ
-                event = _build_event(
-                    event_timestamp, event_name, level, duration,
-                    full_props, current_event_start_line, file_path, directory_name
-                )
-                if event:
-                    batch.append(event)
-                    events_count += 1
-            except Exception as e:
-                logger.debug(f"❌ Ошибка последнего события: {e}")
-
-        # 🔧 Вставка остатка
-        if batch:
-            if ch_loader.insert_batch(batch):
-                logger.debug(f"✅ Финальный батч {len(batch)} вставлен")
-            batch = []
-            gc.collect()
-
-        #  Логирование статистики
-        logger.info(
-            f"✅ {file_path.name}: {events_count:,} событий (пропущено {lines_skipped} строк, обработано {lines_processed} строк, строки {start_line + 1}-{last_line_number})")
-
-        # 🔧 Определяем is_complete
-        if lines_processed == 0 and events_count == 0:
-            is_complete = True
-        else:
-            is_complete = False
-
-        return (events_count, last_line_number, last_event_timestamp, is_complete)
-
-    except Exception as e:
-        logger.error(f"❌ Ошибка парсинга {file_path}: {e}")
-        return (0, start_line, None, False)
-
+                last_line = line_number
+                raw_size = len(raw)
+                if first:
+                    decoder = codecs.getincrementaldecoder(encoding)(errors='replace')
+                    pending_cr = b''
+                    if line_number == 1 and raw.startswith(UTF8_BOM):
+                        raw = raw[len(UTF8_BOM):]
+                    match = EVENT_HEADER_PATTERN.match(raw)
+                    if match:
+                        finish_event(line_number - 1)
+                        header = match.groups()[:6]
+                        stream = StreamingProperties(max_retained_chars=max(1, single_event_max_bytes // 8))
+                        event_start = line_number
+                        event_bytes = 0
+                        # Use original bytes after header, not group(7), to keep
+                        # newline handling identical for split and unsplit lines.
+                        raw = raw[match.start(7):]
+                    elif stream is not None:
+                        stream.feed('\n')
+                if stream is not None:
+                    event_bytes += raw_size
+                    data = pending_cr + raw
+                    pending_cr = b''
+                    if at_start:
+                        data = data.rstrip(b'\r\n')
+                    elif data.endswith(b'\r'):
+                        data = data[:-1]
+                        pending_cr = b'\r'
+                    stream.feed(decoder.decode(data, final=at_start))
+                if at_start:
+                    decoder = None
+        finish_event(last_line)
+        flush()
+        logger.info("%s: %d events, lines %d-%d", file_path.name, committed_events,
+                    start_line + 1, last_line)
+        return (committed_events, last_line, committed_ts, last_line == start_line)
+    except Exception as exc:
+        if on_error is not None:
+            on_error(exc)
+        logger.exception("Parsing stopped for %s at line %d; confirmed line %d",
+                         file_path, last_line, committed_line)
+        return (committed_events, committed_line, committed_ts, False)
 
 
 # ============================================================================
@@ -665,7 +811,7 @@ class TJLogDaemon:
                     continue
 
                 # 🔧 НОВОЕ: Пропускаем активные логи, если включена настройка
-                if settings.parser_ignore_active_logs and _is_active_log(log_file):
+                if getattr(settings, 'parser_ignore_active_logs', True) and _is_active_log(log_file):
                     logger.debug(f"⏭ Пропуск активного лога: {log_file.name}")
                     continue
 
@@ -695,24 +841,37 @@ class TJLogDaemon:
         errors = 0
 
         for file_path, directory_name in self._find_new_files():
+            if self._shutdown:
+                break
             files_found += 1
             try:
                 start_line = self.state.get_last_line_number(file_path)
 
+                def save_checkpoint(count, line, timestamp):
+                    self.state.mark_processed(file_path, count, last_line_number=line,
+                                              last_event_timestamp=timestamp, is_complete=False)
+
+                parse_errors = []
                 events, last_line, last_ts, is_complete = parse_file(
-                    file_path, directory_name, self.ch_loader, self.batch_size, start_line
+                    file_path, directory_name, self.ch_loader, self.batch_size, start_line,
+                    checkpoint=save_checkpoint, should_stop=lambda: self._shutdown,
+                    on_error=parse_errors.append
                 )
 
-                self.state.mark_processed(
-                    file_path, events,
-                    last_line_number=last_line,
-                    last_event_timestamp=last_ts,
-                    is_complete=is_complete
-                )
+                # Batch event counts were already persisted. Only finalize position.
+                if last_line > start_line or is_complete:
+                    self.state.mark_processed(
+                        file_path, 0, last_line_number=last_line,
+                        last_event_timestamp=last_ts, is_complete=is_complete
+                    )
 
-                if events >= 0 or last_line > 0:
+                total_events += events
+                if parse_errors:
+                    errors += 1
+                    self.state.update_scan(stats_id, errors_count=errors,
+                                           error_message=str(parse_errors[0])[:500])
+                elif not self._shutdown:
                     files_processed += 1
-                    total_events += events
 
             except Exception as e:
                 logger.error(f"❌ Ошибка обработки {file_path}: {e}")
@@ -772,6 +931,7 @@ class TJLogDaemon:
 
         except Exception as e:
             logger.exception(f"❌ Fatal error: {e}")
+            raise
         finally:
             self._shutdown_handler()
 

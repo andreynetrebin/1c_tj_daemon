@@ -190,7 +190,7 @@ class TestBuildEvent:
         assert event['level'] == 4
         assert event['p_processName'] == 'test'
         assert event['t_computerName'] == 'srv'
-        assert event['t_connectID'] == '100'
+        assert event['t_connectID'] == 100
         assert event['usr'] == 'TestUser'
         assert event['func'] == 'BeginTransaction'
         assert event['directory_name'] == 'SQL_Locks'
@@ -239,7 +239,7 @@ class TestFirstEventBug:
         assert ev['event_name'] == 'SDBL'
         assert ev['p_processName'] == 'happywear_new'
         assert ev['t_computerName'] == 'Server1C'
-        assert ev['t_connectID'] == '140666'
+        assert ev['t_connectID'] == 140666
         assert ev['usr'] == 'DefUser'
         assert ev['func'] == 'BeginTransaction'
 
@@ -387,7 +387,7 @@ class TestIncremental:
         )
         events = mock_ch_loader2.get_all_events()
         assert events[0]['event_name'] == 'TLOCK'
-        assert events[0]['t_connectID'] == '200'
+        assert events[0]['t_connectID'] == 200
 
 
 # ============================================================================
@@ -433,8 +433,10 @@ class TestEdgeCases:
 
     def test_ch_insert_failure(self, multi_event_file, mock_ch_loader):
         mock_ch_loader.set_fail_mode(True)
-        events_count, _, _, _ = parse_file(
+        events_count, last_line, _, is_complete = parse_file(
             multi_event_file, "test_dir", mock_ch_loader,
             batch_size=100, start_line=0
         )
-        assert events_count == 3
+        assert events_count == 0
+        assert last_line == 0
+        assert is_complete is False
