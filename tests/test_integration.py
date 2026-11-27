@@ -181,7 +181,7 @@ class TestParserWithClickHouse:
         log_file.write_bytes(
             b"00:01.572065-0,SDBL,4,p:processName=test_app,"
             b"t:computerName=Server1C,t:connectID=100,Usr=TestUser,"
-            b"Func=BeginTransaction\n"
+            b"Regions=AccumRg44591.DIMS,Func=BeginTransaction\n"
         )
 
         parse_file(log_file, "test_dir", mock_ch_loader,
@@ -208,6 +208,7 @@ class TestParserWithClickHouse:
         assert event['t_connectID'] == 100
         assert event['usr'] == 'TestUser'
         assert event['func'] == 'BeginTransaction'
+        assert event['regions'] == 'AccumRg44591.DIMS'
 
 
 # ============================================================================
