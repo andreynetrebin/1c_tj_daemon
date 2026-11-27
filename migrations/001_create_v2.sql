@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS NetrebinAA.tj_events_ut_v2
     planSQLText String CODEC(ZSTD(3)),
     exception String CODEC(ZSTD(3)),
     locks String CODEC(ZSTD(3)),
+    regions String,
     waitConnections String,
     deadlockConnectionIntersections String,
     lkaid String,
