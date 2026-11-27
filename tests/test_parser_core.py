@@ -25,6 +25,7 @@ from parser import (
     _parse_props,
     _build_event,
     EVENT_HEADER_PATTERN,
+    ClickHouseLoader,
 )
 from tests.conftest import MockClickHouseLoader
 
@@ -458,3 +459,18 @@ class TestRegionsProperty:
         props = StreamingProperties()
         props.feed('p:processName=Happywear_New,Regions=AccumRg44591.DIMS,Locks=Exclusive')
         assert props.finish()['Regions'] == 'AccumRg44591.DIMS'
+
+
+class TestClickHouseRegionsInsert:
+    def test_insert_batch_includes_regions_column(self):
+        class FakeClient:
+            def insert(self, **kwargs):
+                self.kwargs = kwargs
+
+        loader = ClickHouseLoader.__new__(ClickHouseLoader)
+        loader.table_name = 'tj_events_ut_v2'
+        loader.client = FakeClient()
+        assert loader.insert_batch([{'regions': 'AccumRg44591.DIMS'}]) is True
+        assert 'regions' in loader.client.kwargs['column_names']
+        regions_index = loader.client.kwargs['column_names'].index('regions')
+        assert loader.client.kwargs['data'][0][regions_index] == 'AccumRg44591.DIMS'
