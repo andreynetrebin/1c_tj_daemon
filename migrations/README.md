@@ -72,3 +72,8 @@ Fresh installations use updated 001/002. Existing v2 installations with legacy c
 ## Результаты приёмки 25.11.2026
 
 По журналам и SQL-проверкам оператора: 129 тестов прошли (7,38 с, одно предупреждение SQLAlchemy); файл 2,4 GiB — 41 событие, 41 уникальная начальная строка; после увеличения бюджета до 512 MiB цикл из 15 файлов завершён с 83 102 событиями и 0 ошибок за 413,8 с. VmHWM процесса 389160 KiB, VmRSS 98940 KiB, VmSwap 0. Среди CALL, загруженных после 09:24:05 MSK, 4742 из 4742 имеют cpuTime_sec, старый cpuTime NULL у всех. В проверенной выборке новых вставок дубликатов нет (не является гарантией exactly-once или отсутствия пересечений с историей). Сохранять лимит systemd 4 GiB. Не удалять исходные журналы до подтверждения загрузки. Прежний CPU-столбец не удалять, пока на него ссылается DEFAULT.
+
+
+## Regions property
+
+Existing installations should stop the daemon and apply `004_add_regions.sql` before or alongside deployment. The migration file uses the default `NetrebinAA.tj_events_ut_v2` and `NetrebinAA.tj_events_ut_all` names; adjust them if `CLICKHOUSE_DATABASE` or `CLICKHOUSE_TABLE_NAME` differs. The parser also issues an idempotent `ADD COLUMN IF NOT EXISTS` when ensuring the target table, so an existing target table is upgraded automatically. Fresh installations include `regions String` in `001_create_v2.sql`. The migration also replaces `tj_events_ut_all` so that legacy rows expose an empty `regions` value and v2 rows expose the parsed value. The property is stored as received from the TJ event header (for example `AccumRg44591.DIMS`).

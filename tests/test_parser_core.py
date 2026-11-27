@@ -25,6 +25,7 @@ from parser import (
     _parse_props,
     _build_event,
     EVENT_HEADER_PATTERN,
+    ClickHouseLoader,
 )
 from tests.conftest import MockClickHouseLoader
 
@@ -440,3 +441,36 @@ class TestEdgeCases:
         assert events_count == 0
         assert last_line == 0
         assert is_complete is False
+
+class TestRegionsProperty:
+    """Проверка сохранения свойства Regions из заголовка события."""
+
+    def test_build_event_parses_regions(self, tmp_path):
+        event = _build_event(
+            datetime(2026, 11, 27, 9, 16, 0), 'TLOCK', 4, 30561969,
+            'p:processName=Happywear_New,Regions=AccumRg44591.DIMS,Locks=Exclusive',
+            1, tmp_path / '26112709.log', 'test_dir'
+        )
+        assert event is not None
+        assert event['regions'] == 'AccumRg44591.DIMS'
+
+    def test_streaming_properties_retains_regions(self):
+        from parser import StreamingProperties
+        props = StreamingProperties()
+        props.feed('p:processName=Happywear_New,Regions=AccumRg44591.DIMS,Locks=Exclusive')
+        assert props.finish()['Regions'] == 'AccumRg44591.DIMS'
+
+
+class TestClickHouseRegionsInsert:
+    def test_insert_batch_includes_regions_column(self):
+        class FakeClient:
+            def insert(self, **kwargs):
+                self.kwargs = kwargs
+
+        loader = ClickHouseLoader.__new__(ClickHouseLoader)
+        loader.table_name = 'tj_events_ut_v2'
+        loader.client = FakeClient()
+        assert loader.insert_batch([{'regions': 'AccumRg44591.DIMS'}]) is True
+        assert 'regions' in loader.client.kwargs['column_names']
+        regions_index = loader.client.kwargs['column_names'].index('regions')
+        assert loader.client.kwargs['data'][0][regions_index] == 'AccumRg44591.DIMS'
