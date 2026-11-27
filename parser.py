@@ -144,6 +144,7 @@ class ClickHouseLoader:
                 planSQLText String CODEC(ZSTD(3)),
                 exception String CODEC(ZSTD(3)),
                 locks String CODEC(ZSTD(3)),
+                regions String,
                 waitConnections String,
                 deadlockConnectionIntersections String,
                 lkaid String,
@@ -166,6 +167,8 @@ class ClickHouseLoader:
             TTL timestamp + INTERVAL 30 DAY
             SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1
         """)
+        # Existing installations may already have the table without this property.
+        self.client.command(f"ALTER TABLE {db}.{quoted} ADD COLUMN IF NOT EXISTS regions String AFTER locks")
         logger.info(f"✅ Таблица {db}.{quoted} готова")
 
     def insert_batch(self, events: List[Dict[str, Any]]) -> bool:
@@ -207,6 +210,7 @@ class ClickHouseLoader:
                     (e.get('planSQLText') or '')[:100000],
                     (e.get('exception') or '')[:100000],
                     e.get('locks', ''),
+                    e.get('regions', ''),
                     e.get('waitConnections', ''),
                     e.get('deadlockConnectionIntersections', ''),
                     e.get('lkaid', ''),
@@ -231,7 +235,7 @@ class ClickHouseLoader:
                     't_connectID', 'usr', 'dbpid', 'osThread', 'sessionID', 'trans', 'func',
                     'module', 'method', 'memory', 'memoryPeak', 'inBytes', 'outBytes', 'cpuTime_sec',
                     'tableName', 'context', 'sql', 'sdbl', 'planSQLText', 'exception',
-                    'locks', 'waitConnections', 'deadlockConnectionIntersections',
+                    'locks', 'regions', 'waitConnections', 'deadlockConnectionIntersections',
                     'lkaid', 'lka', 'lkp', 'lkpid', 'lksrc', 'rows', 'rowsAffected',
                     'description', 'data', 'severity', 'category'
                 ]
@@ -427,7 +431,7 @@ _TRUNCATED_PROPERTIES = {'Context', 'Sql', 'SQL', 'Sdbl', 'planSQLText', 'Except
 _STORED_PROPERTIES = _TRUNCATED_PROPERTIES | {
     'p:processName', 't:computerName', 't:connectID', 'Usr', 'dbpid',
     'OSThread', 'SessionID', 'Trans', 'Func', 'Module', 'Method', 'Memory',
-    'MemoryPeak', 'InBytes', 'OutBytes', 'CpuTime', 'tableName', 'Locks',
+    'MemoryPeak', 'InBytes', 'OutBytes', 'CpuTime', 'tableName', 'Locks', 'Regions',
     'WaitConnections', 'DeadlockConnectionIntersections', 'lkaid', 'lka',
     'lkp', 'lkpid', 'lksrc', 'Rows', 'RowsAffected', 'Description'
 }
@@ -579,6 +583,7 @@ def _build_event(timestamp: datetime, event_name: str, level: int,
             'planSQLText': props.get('planSQLText', '')[:100000],
             'exception': props.get('Exception', '')[:100000],
             'locks': props.get('Locks', ''),
+            'regions': props.get('Regions', ''),
             'waitConnections': props.get('WaitConnections', ''),
             'deadlockConnectionIntersections': props.get('DeadlockConnectionIntersections', ''),
             'lkaid': props.get('lkaid', ''),
