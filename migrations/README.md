@@ -76,4 +76,4 @@ Fresh installations use updated 001/002. Existing v2 installations with legacy c
 
 ## Regions property
 
-Existing installations must stop the daemon and apply `004_add_regions.sql` to the configured ClickHouse database/table before or alongside deployment. The parser also issues an idempotent `ADD COLUMN IF NOT EXISTS` when ensuring the target table, so an existing table is upgraded automatically. Fresh installations include `regions String` in `001_create_v2.sql`. The property is stored as received from the TJ event header (for example `AccumRg44591.DIMS`).
+Existing installations should stop the daemon and apply `004_add_regions.sql` to the configured ClickHouse database/table before or alongside deployment. The parser also issues an idempotent `ADD COLUMN IF NOT EXISTS` when ensuring the target table, so an existing target table is upgraded automatically. Fresh installations include `regions String` in `001_create_v2.sql`. The migration also replaces `tj_events_ut_all` so that legacy rows expose an empty `regions` value and v2 rows expose the parsed value. The property is stored as received from the TJ event header (for example `AccumRg44591.DIMS`).
