@@ -440,3 +440,21 @@ class TestEdgeCases:
         assert events_count == 0
         assert last_line == 0
         assert is_complete is False
+
+class TestRegionsProperty:
+    """Проверка сохранения свойства Regions из заголовка события."""
+
+    def test_build_event_parses_regions(self, tmp_path):
+        event = _build_event(
+            datetime(2026, 11, 27, 9, 16, 0), 'TLOCK', 4, 30561969,
+            'p:processName=Happywear_New,Regions=AccumRg44591.DIMS,Locks=Exclusive',
+            1, tmp_path / '26112709.log', 'test_dir'
+        )
+        assert event is not None
+        assert event['regions'] == 'AccumRg44591.DIMS'
+
+    def test_streaming_properties_retains_regions(self):
+        from parser import StreamingProperties
+        props = StreamingProperties()
+        props.feed('p:processName=Happywear_New,Regions=AccumRg44591.DIMS,Locks=Exclusive')
+        assert props.finish()['Regions'] == 'AccumRg44591.DIMS'
